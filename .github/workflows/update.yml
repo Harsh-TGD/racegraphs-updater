@@ -1,0 +1,34 @@
+name: Update RaceGraphs results
+
+on:
+  workflow_dispatch:
+  schedule:
+    # Every five minutes, offset from the busiest minute of the hour.
+    - cron: '3-58/5 * * * *'
+
+permissions:
+  contents: read
+
+concurrency:
+  group: racegraphs-results-v0042
+  cancel-in-progress: false
+
+jobs:
+  update:
+    runs-on: ubuntu-latest
+    timeout-minutes: 8
+    steps:
+      - name: Read updater files
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          persist-credentials: false
+      - name: Set up Node
+        uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
+        with:
+          node-version: '22'
+      - name: Check and publish results
+        env:
+          RG_R2_CONFIG: ${{ secrets.RACEGRAPHS_R2 }}
+          GITHUB_TOKEN: ${{ github.token }}
+          RG_FORCE: ${{ github.event_name == 'workflow_dispatch' }}
+        run: node scripts/update.mjs
