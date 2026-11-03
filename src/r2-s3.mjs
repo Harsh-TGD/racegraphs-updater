@@ -2,6 +2,8 @@ import {createHash,createHmac} from 'node:crypto';
 const sha=data=>createHash('sha256').update(data).digest('hex');
 const hmac=(key,data)=>createHmac('sha256',key).update(data).digest();
 const uri=s=>encodeURIComponent(s).replace(/[!'()*]/g,c=>'%'+c.charCodeAt(0).toString(16).toUpperCase());
+// R2 object IDs must not retain HTTP's weak-representation wrapper.
+export const objectEtag=value=>String(value||'').trim().replace(/^W\//i,'').replace(/^"|"$/g,'');
 export function parseConfig(text){
   let c;try{c=JSON.parse(text||'');}catch{throw Error('Add the RACEGRAPHS_R2 repository secret using START-HERE.html.');}
   if(!c||typeof c!=='object')throw Error('RACEGRAPHS_R2 must contain the generated JSON configuration.');
@@ -28,19 +30,22 @@ export class S3Bucket{
   async request(method,key,body='',headers={}){
     for(let attempt=0;attempt<3;attempt++){
       const signed=sign(this.config,method,key,body,headers,this.clock());let response;
-      try{response=await this.fetcher(signed.url,{method,headers:signed.headers,...(['PUT','POST'].includes(method)?{body}:{}),signal:AbortSignal.timeout(30000)});}
+      // Keep transport negotiation outside SigV4's signed headers: an edge may
+      // adjust Accept-Encoding. Prefer the original object's representation.
+      const requestHeaders={...signed.headers,...(['GET','HEAD'].includes(method)?{'accept-encoding':'identity'}:{})};
+      try{response=await this.fetcher(signed.url,{method,headers:requestHeaders,...(['PUT','POST'].includes(method)?{body}:{}),signal:AbortSignal.timeout(30000)});}
       catch{if(attempt<2){await this.pause(300*(attempt+1));continue;}throw Error('R2 connection failed. Check the account ID and retry the workflow.');}
       if([429,500,502,503,504].includes(response.status)&&attempt<2){await response.body?.cancel();await this.pause(300*(attempt+1));continue;}
       if(response.ok||response.status===404||response.status===412)return response;
       const status=response.status;await response.body?.cancel();throw Error('R2 '+method+' failed ('+status+'). Check bucket-scoped Object Read & Write credentials.');
     }
   }
-  async get(key){const r=await this.request('GET',key);if(r.status===404)return null;if(r.status===412)throw Error('Unexpected R2 read conflict');const body=await r.text(),httpEtag=r.headers.get('etag')||'';return {body,httpEtag,etag:httpEtag.replace(/^"|"$/g,''),json:async()=>JSON.parse(body)};}
+  async get(key){const r=await this.request('GET',key);if(r.status===404){await r.body?.cancel();return null;}if(r.status===412)throw Error('Unexpected R2 read conflict');const body=await r.text(),httpEtag=r.headers.get('etag')||'';return {body,httpEtag,etag:objectEtag(httpEtag),json:async()=>JSON.parse(body)};}
   async put(key,body,options={}){
     const headers={'content-type':options.httpMetadata?.contentType||'application/json; charset=utf-8','cache-control':options.httpMetadata?.cacheControl||'no-store'};
-    if(options.onlyIf?.etagMatches)headers['if-match']='"'+options.onlyIf.etagMatches.replace(/^"|"$/g,'')+'"';
+    if(options.onlyIf?.etagMatches)headers['if-match']='"'+objectEtag(options.onlyIf.etagMatches)+'"';
     if(options.onlyIf?.etagDoesNotMatch)headers['if-none-match']=options.onlyIf.etagDoesNotMatch;
-    const r=await this.request('PUT',key,body,headers);if(r.status===412)return null;if(!r.ok)throw Error('R2 bucket not found');const etag=(r.headers.get('etag')||'').replace(/^"|"$/g,'');await r.body?.cancel();return {etag};
+    const r=await this.request('PUT',key,body,headers);if(r.status===412){await r.body?.cancel();return null;}if(!r.ok)throw Error('R2 bucket not found');const etag=objectEtag(r.headers.get('etag'));await r.body?.cancel();return {etag};
   }
   async delete(key){const r=await this.request('DELETE',key);await r.body?.cancel();}
 }
