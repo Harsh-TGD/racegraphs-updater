@@ -1,0 +1,64 @@
+name: Test RaceGraphs pipeline
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: racegraphs-results-v0042
+  cancel-in-progress: false
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    timeout-minutes: 8
+    steps:
+      - name: Read updater files
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+        with:
+          persist-credentials: false
+      - name: Set up Node
+        uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020
+        with:
+          node-version: '22'
+      - name: Record test start
+        run: node -e "require('node:fs').writeFileSync('.pipeline-check-start',String(Date.now()))"
+      - name: Test simulated new results, corrections and failures
+        run: node --test tests/*.test.mjs
+      - name: Force a live source check and publish fresh status
+        env:
+          RG_R2_CONFIG: ${{ secrets.RACEGRAPHS_R2 }}
+          GITHUB_TOKEN: ${{ github.token }}
+          RG_FORCE: 'true'
+        run: node scripts/update.mjs
+      - name: Verify fresh live status, manifest and championship graph
+        run: |
+          node --input-type=module <<'NODE'
+          import fs from 'node:fs';
+          import assert from 'node:assert/strict';
+          const endpoint='https://racegraphs-updater.harshisworking.workers.dev';
+          const started=Number(fs.readFileSync('.pipeline-check-start','utf8'));
+          async function load(path){
+            const r=await fetch(endpoint+path,{headers:{Origin:'https://racegraphs.com','Cache-Control':'no-cache'},signal:AbortSignal.timeout(15000)});
+            assert.equal(r.status,200,path+' must return HTTP 200');
+            assert.equal(r.headers.get('Access-Control-Allow-Origin'),'https://racegraphs.com');
+            return r.json();
+          }
+          let status,manifest;
+          for(let attempt=0;attempt<12;attempt++){
+            [status,manifest]=await Promise.all([load('/status?check='+Date.now()),load('/manifest.json?check='+Date.now())]);
+            if(Date.parse(status.checkedAt)>=started&&Date.parse(manifest.checkedAt)>=started)break;
+            if(attempt<11)await new Promise(r=>setTimeout(r,5000));
+          }
+          assert.ok(Date.parse(status.checkedAt)>=started,'Status did not reflect this test source check');
+          assert.ok(Date.parse(manifest.checkedAt)>=started,'Manifest did not reflect this test source check');
+          assert.equal(status.updateError,false);assert.equal(manifest.updateError,false);
+          assert.equal(manifest.schemaVersion,1);assert.ok(Array.isArray(manifest.events));
+          const path=manifest.paths['/data/charts/2026.json'];assert.ok(path,'Published graph path missing');
+          const chart=await load(path);assert.equal(chart.completedRounds,manifest.completedRounds);
+          assert.ok(Object.keys(chart.driverSeries||{}).length>0);assert.ok(Object.keys(chart.constructorSeries||{}).length>0);
+          console.log(JSON.stringify({result:'PASS',sourceVersion:manifest.sourceVersion,completedRounds:manifest.completedRounds,checkedAt:status.checkedAt,graphHTTP:200,fictionalResultsPublished:false,automaticScheduling:'separate check'},null,2));
+          if(process.env.GITHUB_STEP_SUMMARY)fs.appendFileSync(process.env.GITHUB_STEP_SUMMARY,'### Pipeline verification passed\n\n- Simulated new-result/failure tests passed.\n- Real source check reached R2 and the live Worker.\n- Published driver/team graph fetched successfully.\n- No fictional race results published.\n- Automatic scheduling remains a separate check.\n');
+          NODE
